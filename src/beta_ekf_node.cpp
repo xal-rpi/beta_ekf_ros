@@ -31,6 +31,18 @@ bool finite(double value)
 	return std::isfinite(value);
 }
 
+const char *stateName(int index)
+{
+	static constexpr const char *names[] {
+		"pos_e", "pos_n", "psi", "vx", "vy", "yaw_rate",
+		"rear_wheel_speed", "delta_fx_hat", "delta_fy_hat"
+	};
+
+	return index >= 0 && index < static_cast<int>(std::size(names))
+		? names[index]
+		: "unknown";
+}
+
 }  // namespace
 
 class BetaEkfNode : public rclcpp::Node
@@ -64,36 +76,43 @@ private:
 	// -------------------------------------------------------------------------
 	struct ProcessInputs
 	{
-		float rear_wheel_torque_nm{0.0F};
-		float roadwheel_angle_rad{0.0F};
-		float brake{0.0F};
+		float rear_wheel_torque_nm{0.0F};  // Scalar [N m], model sign convention.
+		float roadwheel_angle_rad{0.0F};  // Scalar [rad], model steering convention.
+		float brake{0.0F};                // Scalar normalized brake command.
 		bool received{false};
 	};
 
 	struct GpsVelocityMeasurement
 	{
-		float pos_e{0.0F};
-		float pos_n{0.0F};
-		float yaw{0.0F};
-		float body_vx{0.0F};
-		float body_vy{0.0F};
-		float yaw_rate{0.0F};
-		float velocity_ned[3]{};
-		float q_nb[4]{};
+		float pos_e{0.0F};        // World ENU east [m].
+		float pos_n{0.0F};        // World ENU north [m].
+		float yaw{0.0F};          // World ENU yaw: CCW from east [rad].
+		float body_vx{0.0F};      // Body FLU forward [m/s].
+		float body_vy{0.0F};      // Body FLU left [m/s].
+		float yaw_rate{0.0F};     // Body FLU +z/up [rad/s].
+		float velocity_ned[3]{};  // World NED [m/s], for BetaEKF::fuseGpsVelNED().
+		float q_nb[4]{};          // Body FRD -> world NED, [w, x, y, z].
 		bool valid{false};
 		bool updated{false};
 	};
 
 	struct GyroMeasurement
 	{
-		float gyro_frd[3]{};
+		float gyro_frd[3]{};  // Body FRD angular rate [rad/s].
 		bool valid{false};
 		bool updated{false};
 	};
 
 	struct WheelSpeedMeasurement
 	{
-		float rear_wheel_speed_mps{0.0F};
+		float rear_wheel_speed_mps{0.0F};  // Scalar circumferential speed [m/s].
+		bool valid{false};
+		bool updated{false};
+	};
+
+	struct AccelMeasurement
+	{
+		float accel_frd[3]{};  // Body FRD linear acceleration [m/s^2].
 		bool valid{false};
 		bool updated{false};
 	};
@@ -134,6 +153,8 @@ private:
 		tuning.q_delta_fy = tuningParameter("tuning.q_delta_fy", tuning.q_delta_fy);
 		tuning.R_vx = tuningParameter("tuning.r_vx", tuning.R_vx);
 		tuning.R_vy = tuningParameter("tuning.r_vy", tuning.R_vy);
+		tuning.R_accel_x = tuningParameter("tuning.r_accel_x", tuning.R_accel_x);
+		tuning.R_accel_y = tuningParameter("tuning.r_accel_y", tuning.R_accel_y);
 		tuning.R_beta = tuningParameter("tuning.r_beta", tuning.R_beta);
 		tuning.R_yaw_rate = tuningParameter("tuning.r_yaw_rate", tuning.R_yaw_rate);
 		tuning.R_rear_ws = tuningParameter("tuning.r_rear_ws", tuning.R_rear_ws);
@@ -145,6 +166,31 @@ private:
 	float tuningParameter(const std::string &name, float default_value)
 	{
 		return static_cast<float>(declare_parameter(name, static_cast<double>(default_value)));
+	}
+
+	void updateTuningFromParameters()
+	{
+		BetaEKFTuning tuning{};
+		tuning.q_pos_e = static_cast<float>(get_parameter("tuning.q_pos_e").as_double());
+		tuning.q_pos_n = static_cast<float>(get_parameter("tuning.q_pos_n").as_double());
+		tuning.q_psi = static_cast<float>(get_parameter("tuning.q_psi").as_double());
+		tuning.q_vx = static_cast<float>(get_parameter("tuning.q_vx").as_double());
+		tuning.q_vy = static_cast<float>(get_parameter("tuning.q_vy").as_double());
+		tuning.q_yaw_rate = static_cast<float>(get_parameter("tuning.q_yaw_rate").as_double());
+		tuning.q_rear_ws = static_cast<float>(get_parameter("tuning.q_rear_ws").as_double());
+		tuning.q_delta_fx = static_cast<float>(get_parameter("tuning.q_delta_fx").as_double());
+		tuning.q_delta_fy = static_cast<float>(get_parameter("tuning.q_delta_fy").as_double());
+		tuning.R_vx = static_cast<float>(get_parameter("tuning.r_vx").as_double());
+		tuning.R_vy = static_cast<float>(get_parameter("tuning.r_vy").as_double());
+		tuning.R_accel_x = static_cast<float>(get_parameter("tuning.r_accel_x").as_double());
+		tuning.R_accel_y = static_cast<float>(get_parameter("tuning.r_accel_y").as_double());
+		tuning.R_beta = static_cast<float>(get_parameter("tuning.r_beta").as_double());
+		tuning.R_yaw_rate = static_cast<float>(get_parameter("tuning.r_yaw_rate").as_double());
+		tuning.R_rear_ws = static_cast<float>(get_parameter("tuning.r_rear_ws").as_double());
+		tuning.v_min = static_cast<float>(get_parameter("tuning.v_min").as_double());
+		tuning.gate_gamma_max = static_cast<float>(
+			get_parameter("tuning.gate_gamma_max").as_double());
+		ekf_.setTuning(tuning);
 	}
 
 	void createRosInterfaces()
@@ -203,12 +249,14 @@ private:
 			{message->linear_velocity.x, message->linear_velocity.y, message->linear_velocity.z});
 		const frames::Quaternion q_nb = frames::rosFluEnuToCoreFrdNed(ros_quaternion);
 
-		gps_measurement_.pos_e = static_cast<float>(message->position.x);
-		gps_measurement_.pos_n = static_cast<float>(message->position.y);
+		// BngVehicleStateMsg uses world ENU position/orientation and body FLU
+		// velocity/rates. These assignments preserve the EKF state convention.
+		gps_measurement_.pos_e = static_cast<float>(message->position.x);  // ENU east.
+		gps_measurement_.pos_n = static_cast<float>(message->position.y);  // ENU north.
 		gps_measurement_.yaw = static_cast<float>(frames::yawFromRosQuaternion(ros_quaternion));
-		gps_measurement_.body_vx = static_cast<float>(message->linear_velocity.x);
-		gps_measurement_.body_vy = static_cast<float>(message->linear_velocity.y);
-		gps_measurement_.yaw_rate = static_cast<float>(message->angular_velocity.z);
+		gps_measurement_.body_vx = static_cast<float>(message->linear_velocity.x);  // FLU x.
+		gps_measurement_.body_vy = static_cast<float>(message->linear_velocity.y);  // FLU y.
+		gps_measurement_.yaw_rate = static_cast<float>(message->angular_velocity.z);  // FLU z.
 
 		for (int index = 0; index < 3; ++index) {
 			gps_measurement_.velocity_ned[index] = static_cast<float>(velocity_ned[index]);
@@ -233,6 +281,22 @@ private:
 
 		gyro_measurement_.valid = true;
 		gyro_measurement_.updated = true;
+
+		if (finite(message->linear_acceleration.x) && finite(message->linear_acceleration.y) &&
+		    finite(message->linear_acceleration.z)) {
+			const frames::Vector3 accel_frd = frames::fluToFrd({
+				message->linear_acceleration.x,
+				message->linear_acceleration.y,
+				message->linear_acceleration.z
+			});
+
+			for (int index = 0; index < 3; ++index) {
+				accel_measurement_.accel_frd[index] = static_cast<float>(accel_frd[index]);
+			}
+
+			accel_measurement_.valid = true;
+			accel_measurement_.updated = true;
+		}
 
 		float rear_speed = std::numeric_limits<float>::quiet_NaN();
 		const bool rr_ok = finite(message->w_rr);
@@ -288,6 +352,9 @@ private:
 
 	void initializeFromLatestOdometry()
 	{
+		// All values below already use the EKF convention: ENU position/yaw and
+		// FLU body velocity/yaw rate. This path intentionally does not use the
+		// NED/FRD reset helper in BetaEKF.
 		float initial_state[BetaEKF::NX] {
 			gps_measurement_.pos_e,
 			gps_measurement_.pos_n,
@@ -306,10 +373,55 @@ private:
 		ekf_.init(initial_state, initial_variance);
 		estimator_initialized_ = true;
 		reset_requested_ = false;
+		last_gps_accepted_ = false;
+		last_gyro_accepted_ = false;
+		last_wheel_speed_accepted_ = false;
 		last_loop_time_ = std::chrono::steady_clock::now();
 		gps_measurement_.updated = false;
+		gyro_measurement_.updated = false;
+		wheel_speed_measurement_.updated = false;
 
 		RCLCPP_INFO(get_logger(), "Beta EKF initialized from the latest odometry sample");
+	}
+
+	void handleEkfHealthFailure()
+	{
+		const BetaEKFDiagnostics &diagnostics = ekf_.diagnostics();
+		RCLCPP_WARN(
+			get_logger(),
+			"Beta EKF reset: state=%s index=%d reason=%s max_abs_F=%.6g "
+			"max_active_state=%.6g max_active_variance=%.6g dt=%.6g "
+			"rear_wheel_torque=%.6g steering=%.6g brake=%.6g",
+			stateName(diagnostics.failed_state), diagnostics.failed_state,
+			diagnostics.failure_kind, diagnostics.maximum_f_abs,
+			diagnostics.maximum_active_state_abs,
+			diagnostics.maximum_active_variance,
+			diagnostics.prediction_dt, diagnostics.rear_wheel_torque,
+			diagnostics.roadwheel_angle, diagnostics.brake);
+
+		estimator_initialized_ = false;
+		reset_requested_ = true;
+		last_gps_accepted_ = false;
+		last_gyro_accepted_ = false;
+		last_wheel_speed_accepted_ = false;
+
+		if (gps_measurement_.valid) {
+			initializeFromLatestOdometry();
+		}
+	}
+
+	void warnFusionRejected(const char *sensor_name)
+	{
+		const auto &diagnostics = ekf_.lastUpdateDiagnostics();
+		RCLCPP_WARN(
+			get_logger(),
+			"%s fusion rejected: reason=%s innovation=[%.6g %.6g %.6g] "
+			"gamma=%s%.6g gate=%.6g",
+			sensor_name,
+			ekf::updateFailureReasonName(diagnostics.failure),
+			diagnostics.innovation[0], diagnostics.innovation[1], diagnostics.innovation[2],
+			diagnostics.has_gamma ? "" : "unavailable ",
+			diagnostics.gamma, diagnostics.gate_gamma_max);
 	}
 
 	// -------------------------------------------------------------------------
@@ -325,6 +437,7 @@ private:
 		// changed at runtime with `ros2 param set`.
 		measurement_fuse_ratio_ = std::clamp(
 			get_parameter("measurement_fuse_ratio").as_double(), 0.0, 1.0);
+		updateTuningFromParameters();
 
 		if ((!estimator_initialized_ || reset_requested_) && gps_measurement_.valid) {
 			initializeFromLatestOdometry();
@@ -358,11 +471,17 @@ private:
 		const float prediction_dt = static_cast<float>(dt / prediction_steps);
 
 		for (int step = 0; step < prediction_steps; ++step) {
-			ekf_.predict(
+			const bool prediction_ok = ekf_.predict(
 				process_inputs_.rear_wheel_torque_nm,
 				process_inputs_.roadwheel_angle_rad,
 				process_inputs_.brake,
 				prediction_dt);
+
+			if (!prediction_ok || !ekf_.checkHealth()) {
+				handleEkfHealthFailure();
+				publishEstimate();
+				return;
+			}
 		}
 
 		// =====================================================================
@@ -371,7 +490,8 @@ private:
 		const bool measurement_updated =
 			gps_measurement_.updated ||
 			gyro_measurement_.updated ||
-			wheel_speed_measurement_.updated;
+			wheel_speed_measurement_.updated ||
+			accel_measurement_.updated;
 
 		if (measurement_updated && shouldFuseMeasurements(measurement_fuse_ratio_)) {
 			if (fuse_gps_velocity_ && gps_measurement_.updated && gps_measurement_.valid) {
@@ -380,30 +500,50 @@ private:
 					gps_measurement_.velocity_ned[1],
 					gps_measurement_.velocity_ned[2],
 					gps_measurement_.q_nb);
+				if (!last_gps_accepted_) {
+					warnFusionRejected("GPS velocity");
+				}
 			}
+		}
 
 			if (fuse_gyro_ && gyro_measurement_.updated && gyro_measurement_.valid) {
 				last_gyro_accepted_ = ekf_.fuseGyro(gyro_measurement_.gyro_frd);
+				if (!last_gyro_accepted_) {
+					warnFusionRejected("Gyro");
+				}
 			}
 
 			if (fuse_wheel_speed_ && wheel_speed_measurement_.updated && wheel_speed_measurement_.valid) {
 				last_wheel_speed_accepted_ = ekf_.fuseWheelSpeed(
 					wheel_speed_measurement_.rear_wheel_speed_mps);
 			}
-		}
+
+			if (accel_measurement_.updated && accel_measurement_.valid) {
+			    last_accel_accepted_ = ekf_.fuseAccel(accel_measurement_.accel_frd);
+				// if (!last_accel_accepted_) {
+				// 	warnFusionRejected("Acceleration");
+				// }
+			}
 
 		// Match the PX4 update semantics: a sample skipped by the ratio is not
 		// fused later. A future callback must provide a new sample.
 		gps_measurement_.updated = false;
 		gyro_measurement_.updated = false;
 		wheel_speed_measurement_.updated = false;
+		accel_measurement_.updated = false;
+
+		if (!ekf_.checkHealth()) {
+			handleEkfHealthFailure();
+			publishEstimate();
+			return;
+		}
 
 		publishEstimate();
 	}
 
 	void publishEstimate()
 	{
-		if (!ekf_.initialized()) {
+		if (!ekf_.initialized() || !estimator_initialized_ || !ekf_.healthy()) {
 			return;
 		}
 
@@ -411,15 +551,21 @@ private:
 		msg::BetaEkfState state;
 		state.header.stamp = static_cast<builtin_interfaces::msg::Time>(stamp);
 		state.header.frame_id = odom_frame_;
+		// State frame convention: position/yaw are world ENU; velocity and rate
+		// are body FLU. odom_frame_ must name the corresponding world frame.
 		state.initialized = estimator_initialized_;
 		state.vehicle_input_stale = !process_inputs_.received;
 		state.gps_velocity_accepted = last_gps_accepted_;
 		state.gyro_accepted = last_gyro_accepted_;
 		state.wheel_speed_accepted = last_wheel_speed_accepted_;
+		state.fuse_freq = static_cast<float>(measurement_fuse_ratio_ * loop_rate_hz_);
+		state.accel_accepted = last_accel_accepted_;
 		state.state = {{
 			ekf_.posE(), ekf_.posN(), ekf_.psi(), ekf_.vx(), ekf_.vy(), ekf_.yawRate(),
 			ekf_.rearWheelSpeed(), ekf_.deltaFxHat(), ekf_.deltaFyHat()
 		}};
+		// state[0:2] and state[2] are world ENU; state[3:5] are body FLU;
+		// state[6] is scalar wheel speed; state[7:8] are body FLU force estimates.
 		state.variance = {{
 			ekf_.varPosE(), ekf_.varPosN(), ekf_.varPsi(), ekf_.varVx(), ekf_.varVy(),
 			ekf_.varYawRate(), ekf_.varRearWheelSpeed(), ekf_.varDeltaFxHat(), ekf_.varDeltaFyHat()
@@ -472,6 +618,7 @@ private:
 	GpsVelocityMeasurement gps_measurement_{};
 	GyroMeasurement gyro_measurement_{};
 	WheelSpeedMeasurement wheel_speed_measurement_{};
+	AccelMeasurement accel_measurement_{};
 
 	double loop_rate_hz_{200.0};
 	double measurement_fuse_ratio_{1.0};
@@ -485,7 +632,7 @@ private:
 	bool last_gps_accepted_{false};
 	bool last_gyro_accepted_{false};
 	bool last_wheel_speed_accepted_{false};
-
+	bool last_accel_accepted_{false};
 	std::string odom_frame_;
 	std::string base_frame_;
 	std::string vehicle_state_topic_;

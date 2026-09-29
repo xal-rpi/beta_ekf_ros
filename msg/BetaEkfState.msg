@@ -14,3 +14,5 @@ float32 beta_rad
 bool gps_velocity_accepted
 bool gyro_accepted
 bool wheel_speed_accepted
+bool accel_accepted
+float32 fuse_freq
