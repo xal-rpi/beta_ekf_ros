@@ -5,9 +5,9 @@ bool vehicle_input_stale
 
 # State and diagonal covariance order:
 # [pos_e, pos_n, psi, vel_x, vel_y, yaw_rate,
-#  rear_wheelspeed_ms, deltaFx_hat, deltaFy_hat]
-float32[9] state
-float32[9] variance
+#  rear_wheelspeed_ms, deltaFx_hat, deltaFy_hat, mu_scale]
+float32[10] state
+float32[10] variance
 
 float32 beta_rad
 

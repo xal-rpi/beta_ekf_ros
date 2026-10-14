@@ -35,7 +35,7 @@ const char *stateName(int index)
 {
 	static constexpr const char *names[] {
 		"pos_e", "pos_n", "psi", "vx", "vy", "yaw_rate",
-		"rear_wheel_speed", "delta_fx_hat", "delta_fy_hat"
+		"rear_wheel_speed", "delta_fx_hat", "delta_fy_hat", "mu_scale"
 	};
 
 	return index >= 0 && index < static_cast<int>(std::size(names))
@@ -364,10 +364,11 @@ private:
 			gps_measurement_.yaw_rate,
 			std::max(gps_measurement_.body_vx, 0.1F),
 			0.0F,
-			0.0F
+			0.0F,
+			1.0F
 		};
 		float initial_variance[BetaEKF::NX] {
-			25.0F, 25.0F, 1.0F, 0.10F, 0.10F, 0.25F, 1.0F, 4.0F, 4.0F
+			25.0F, 25.0F, 1.0F, 0.10F, 0.10F, 0.25F, 1.0F, 4.0F, 4.0F, 0.25F
 		};
 
 		ekf_.init(initial_state, initial_variance);
@@ -562,13 +563,15 @@ private:
 		state.accel_accepted = last_accel_accepted_;
 		state.state = {{
 			ekf_.posE(), ekf_.posN(), ekf_.psi(), ekf_.vx(), ekf_.vy(), ekf_.yawRate(),
-			ekf_.rearWheelSpeed(), ekf_.deltaFxHat(), ekf_.deltaFyHat()
+			ekf_.rearWheelSpeed(), ekf_.deltaFxHat(), ekf_.deltaFyHat(), ekf_.muScale()
 		}};
 		// state[0:2] and state[2] are world ENU; state[3:5] are body FLU;
-		// state[6] is scalar wheel speed; state[7:8] are body FLU force estimates.
+		// state[6] is scalar wheel speed; state[7:8] are body FLU force estimates;
+		// state[9] is the global friction scale factor.
 		state.variance = {{
 			ekf_.varPosE(), ekf_.varPosN(), ekf_.varPsi(), ekf_.varVx(), ekf_.varVy(),
-			ekf_.varYawRate(), ekf_.varRearWheelSpeed(), ekf_.varDeltaFxHat(), ekf_.varDeltaFyHat()
+			ekf_.varYawRate(), ekf_.varRearWheelSpeed(), ekf_.varDeltaFxHat(), ekf_.varDeltaFyHat(),
+			ekf_.varMuScale()
 		}};
 		state.beta_rad = ekf_.beta();
 		state_publisher_->publish(state);
