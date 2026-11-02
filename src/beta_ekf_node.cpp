@@ -2,6 +2,11 @@
 
 #include "beta_ekf_casadi.hpp"
 #include "beta_ekf_ros/msg/beta_ekf_state.hpp"
+
+extern "C" {
+#include "generated/xal_ekf_model.h"
+}
+#include "generated/xal_ekf_dimensions.h"
 #include "bng_msgs/msg/bng_vehicle_state_msg.hpp"
 
 #include <nav_msgs/msg/odometry.hpp>
@@ -140,6 +145,19 @@ private:
 		state_topic_ = declare_parameter("state_topic", "casadi_ekf/state");
 		odometry_output_topic_ = declare_parameter("odometry_output_topic", "casadi_ekf/odometry");
 		beta_topic_ = declare_parameter("beta_topic", "casadi_ekf/beta");
+		debug_mu_sensitivity_topic_ = declare_parameter(
+			"debug_mu_sensitivity_topic", "casadi_ekf/debug_mu_sensitivity");
+
+		// Debug j_mu diagnostic: off by default because it re-evaluates the CasADi
+		// model every loop. Both values can be changed at runtime with `ros2 param set`.
+		debug_j_mu_enable_ = declare_parameter("debug_j_mu_enable", false);
+		// Fixed mu_scale at which the diagnostic Jacobian column is evaluated.
+		debug_mu_scale_ref_ = static_cast<float>(declare_parameter("debug_mu_scale_ref", 1.0));
+
+		// Debug tire forces / utilization: off by default (extra CasADi call per loop).
+		debug_tire_util_enable_ = declare_parameter("debug_tire_util_enable", false);
+		// Below this planar speed [m/s] gamma is published as NaN (slip ill-defined).
+		debug_tire_util_min_speed_ = declare_parameter("debug_tire_util_min_speed", 2.0);
 
 		BetaEKFTuning tuning{};
 		tuning.q_pos_e = tuningParameter("tuning.q_pos_e", tuning.q_pos_e);
@@ -160,6 +178,14 @@ private:
 		tuning.R_rear_ws = tuningParameter("tuning.r_rear_ws", tuning.R_rear_ws);
 		tuning.v_min = tuningParameter("tuning.v_min", tuning.v_min);
 		tuning.gate_gamma_max = tuningParameter("tuning.gate_gamma_max", tuning.gate_gamma_max);
+		tuning.mu_obs_enable = declare_parameter("tuning.mu_obs_enable", tuning.mu_obs_enable);
+		tuning.mu_obs_lambda = tuningParameter("tuning.mu_obs_lambda", tuning.mu_obs_lambda);
+		tuning.mu_obs_i_low = tuningParameter("tuning.I_mu_low", tuning.mu_obs_i_low);
+		tuning.mu_obs_i_high = tuningParameter("tuning.I_mu_high", tuning.mu_obs_i_high);
+		tuning.mu_obs_sigmoid_a = tuningParameter(
+			"tuning.mu_confidence_sigmoid_a", tuning.mu_obs_sigmoid_a);
+		tuning.mu_obs_p_high = tuningParameter("tuning.mu_obs_p_high", tuning.mu_obs_p_high);
+		tuning.mu_obs_p_low = tuningParameter("tuning.mu_obs_p_low", tuning.mu_obs_p_low);
 		ekf_.setTuning(tuning);
 	}
 
@@ -190,6 +216,30 @@ private:
 		tuning.v_min = static_cast<float>(get_parameter("tuning.v_min").as_double());
 		tuning.gate_gamma_max = static_cast<float>(
 			get_parameter("tuning.gate_gamma_max").as_double());
+		tuning.mu_obs_enable = get_parameter("tuning.mu_obs_enable").as_bool();
+		tuning.mu_obs_lambda = static_cast<float>(get_parameter("tuning.mu_obs_lambda").as_double());
+		tuning.mu_obs_i_low = static_cast<float>(get_parameter("tuning.I_mu_low").as_double());
+		tuning.mu_obs_i_high = static_cast<float>(get_parameter("tuning.I_mu_high").as_double());
+		tuning.mu_obs_sigmoid_a = static_cast<float>(
+			get_parameter("tuning.mu_confidence_sigmoid_a").as_double());
+
+		// BetaEKF::setTuning() clamps invalid values; warn so the user knows.
+		if (!(tuning.mu_obs_i_high > tuning.mu_obs_i_low)) {
+			RCLCPP_WARN_THROTTLE(
+				get_logger(), *get_clock(), 5000,
+				"tuning.I_mu_high (%.6g) must be > tuning.I_mu_low (%.6g); "
+				"using I_mu_high = I_mu_low + 1e-9",
+				tuning.mu_obs_i_high, tuning.mu_obs_i_low);
+		}
+
+		if (!(tuning.mu_obs_sigmoid_a > 0.0F)) {
+			RCLCPP_WARN_THROTTLE(
+				get_logger(), *get_clock(), 5000,
+				"tuning.mu_confidence_sigmoid_a (%.6g) must be > 0; using 1e-3",
+				tuning.mu_obs_sigmoid_a);
+		}
+		tuning.mu_obs_p_high = static_cast<float>(get_parameter("tuning.mu_obs_p_high").as_double());
+		tuning.mu_obs_p_low = static_cast<float>(get_parameter("tuning.mu_obs_p_low").as_double());
 		ekf_.setTuning(tuning);
 	}
 
@@ -200,6 +250,10 @@ private:
 		state_publisher_ = create_publisher<msg::BetaEkfState>(state_topic_, sensor_qos);
 		odometry_publisher_ = create_publisher<nav_msgs::msg::Odometry>(odometry_output_topic_, sensor_qos);
 		beta_publisher_ = create_publisher<std_msgs::msg::Float32>(beta_topic_, sensor_qos);
+		// Created unconditionally so debug_j_mu_enable can be toggled at runtime;
+		// it only publishes while the debug diagnostic is enabled.
+		debug_mu_sensitivity_publisher_ = create_publisher<std_msgs::msg::Float32>(
+			debug_mu_sensitivity_topic_, sensor_qos);
 
 		// ---------------------------------------------------------------------
 		// ROS SUBSCRIPTION ADAPTERS
@@ -378,6 +432,9 @@ private:
 		last_gyro_accepted_ = false;
 		last_wheel_speed_accepted_ = false;
 		last_loop_time_ = std::chrono::steady_clock::now();
+		debug_j_mu_ = std::numeric_limits<float>::quiet_NaN();
+		debug_tire_forces_.fill(std::numeric_limits<float>::quiet_NaN());
+		debug_gamma_.fill(std::numeric_limits<float>::quiet_NaN());
 		gps_measurement_.updated = false;
 		gyro_measurement_.updated = false;
 		wheel_speed_measurement_.updated = false;
@@ -533,13 +590,140 @@ private:
 		wheel_speed_measurement_.updated = false;
 		accel_measurement_.updated = false;
 
+		// Friction information for this cycle -> c_mu, and the P_mu floor.
+		ekf_.finalizeMuCycle();
+
 		if (!ekf_.checkHealth()) {
 			handleEkfHealthFailure();
 			publishEstimate();
 			return;
 		}
 
+		// Debug j_mu diagnostic; skipped entirely (no extra CasADi call) when disabled.
+		debug_j_mu_enable_ = get_parameter("debug_j_mu_enable").as_bool();
+
+		if (debug_j_mu_enable_) {
+			debug_mu_scale_ref_ = static_cast<float>(get_parameter("debug_mu_scale_ref").as_double());
+			debug_j_mu_ = computeDebugMuSensitivity();
+		} else {
+			debug_j_mu_ = std::numeric_limits<float>::quiet_NaN();
+		}
+
+		// Debug tire forces / utilization; skipped entirely when disabled.
+		debug_tire_util_enable_ = get_parameter("debug_tire_util_enable").as_bool();
+		debug_tire_forces_.fill(std::numeric_limits<float>::quiet_NaN());
+		debug_gamma_.fill(std::numeric_limits<float>::quiet_NaN());
+
+		if (debug_tire_util_enable_) {
+			debug_tire_util_min_speed_ = get_parameter("debug_tire_util_min_speed").as_double();
+			computeDebugTireUtilization();
+		}
+
 		publishEstimate();
+	}
+
+	// -------------------------------------------------------------------------
+	// DEBUG DIAGNOSTIC: model tire forces and friction-ellipse utilization
+	//
+	// Evaluates xal_tire_forces on local copies at the current EKF state (with
+	// the estimated mu_scale) and inputs. Fills debug_tire_forces_ and, above
+	// debug_tire_util_min_speed_, debug_gamma_. The EKF is not touched.
+	// -------------------------------------------------------------------------
+	void computeDebugTireUtilization()
+	{
+		casadi_real x_in[BetaEKF::NX] {
+			ekf_.posE(), ekf_.posN(), ekf_.psi(), ekf_.vx(), ekf_.vy(), ekf_.yawRate(),
+			ekf_.rearWheelSpeed(), ekf_.deltaFxHat(), ekf_.deltaFyHat(), ekf_.muScale()
+		};
+		casadi_real u_in[XAL_EKF_NU] {
+			process_inputs_.rear_wheel_torque_nm,
+			process_inputs_.roadwheel_angle_rad,
+			process_inputs_.brake
+		};
+
+		casadi_real forces_raw[XAL_TIRE_N_FORCES] {};
+		casadi_real gamma_raw[XAL_TIRE_N_GAMMA] {};
+
+		const casadi_real *arg[XAL_TIRE_SZ_ARG] {};
+		casadi_real *res[XAL_TIRE_SZ_RES] {};
+		casadi_int iw[XAL_TIRE_SZ_IW] {};
+		casadi_real w[XAL_TIRE_SZ_W] {};
+
+		arg[0] = x_in;
+		arg[1] = u_in;
+		res[0] = forces_raw;
+		res[1] = gamma_raw;
+
+		if (xal_tire_forces(arg, res, iw, w, 0) != 0) {
+			return;  // Leave the outputs NaN.
+		}
+
+		for (int i = 0; i < XAL_TIRE_N_FORCES; ++i) {
+			debug_tire_forces_[i] = static_cast<float>(forces_raw[i]);
+		}
+
+		const double speed = std::hypot(ekf_.vx(), ekf_.vy());
+
+		if (speed >= debug_tire_util_min_speed_) {
+			for (int i = 0; i < XAL_TIRE_N_GAMMA; ++i) {
+				debug_gamma_[i] = static_cast<float>(gamma_raw[i]);
+			}
+		}
+	}
+
+	// -------------------------------------------------------------------------
+	// DEBUG DIAGNOSTIC: process-model sensitivity to mu_scale
+	//
+	// Re-evaluates the generated discrete model on local copies only, at the
+	// current EKF state but with mu_scale = debug_mu_scale_ref_ and a fixed
+	// nominal dt, and returns ||F[3..8][MU_SCALE]||_2 (vehicle rows, self-term
+	// excluded). The EKF state, covariance, and update logic are not touched.
+	// -------------------------------------------------------------------------
+	float computeDebugMuSensitivity() const
+	{
+		casadi_real x_in[BetaEKF::NX] {
+			ekf_.posE(), ekf_.posN(), ekf_.psi(), ekf_.vx(), ekf_.vy(), ekf_.yawRate(),
+			ekf_.rearWheelSpeed(), ekf_.deltaFxHat(), ekf_.deltaFyHat(), debug_mu_scale_ref_
+		};
+		casadi_real u_in[XAL_EKF_NU] {
+			process_inputs_.rear_wheel_torque_nm,
+			process_inputs_.roadwheel_angle_rad,
+			process_inputs_.brake
+		};
+		// F_mu = dt * A_mu with forward Euler, so a fixed dt keeps loop jitter out of J_mu.
+		casadi_real dt_in = static_cast<casadi_real>(1.0 / loop_rate_hz_);
+
+		casadi_real x_next_raw[BetaEKF::NX] {};
+		casadi_real F_raw[BetaEKF::NX * BetaEKF::NX] {};
+		casadi_real G_raw[BetaEKF::NX * XAL_EKF_NU] {};
+
+		const casadi_real *arg[XAL_PREDICT_SZ_ARG] {};
+		casadi_real *res[XAL_PREDICT_SZ_RES] {};
+		casadi_int iw[XAL_PREDICT_SZ_IW] {};
+		casadi_real w[XAL_PREDICT_SZ_W] {};
+
+		arg[0] = x_in;
+		arg[1] = u_in;
+		arg[2] = &dt_in;
+		res[0] = x_next_raw;
+		res[1] = F_raw;
+		res[2] = G_raw;
+
+		if (xal_discrete_predict(arg, res, iw, w, 0) != 0) {
+			return std::numeric_limits<float>::quiet_NaN();
+		}
+
+		// CasADi dense output is column-major: F[row][col] = F_raw[row + col * NX].
+		// Rows 0..2 (pos_e, pos_n, psi) are exactly zero for one Euler step;
+		// row MU_SCALE is the trivial self-transition and is excluded.
+		float j2 = 0.0F;
+
+		for (int row = BetaEKF::VX; row <= BetaEKF::DELTA_FY; ++row) {
+			const float value = static_cast<float>(F_raw[row + BetaEKF::MU_SCALE * BetaEKF::NX]);
+			j2 += value * value;
+		}
+
+		return std::isfinite(j2) ? std::sqrt(j2) : std::numeric_limits<float>::quiet_NaN();
 	}
 
 	void publishEstimate()
@@ -574,6 +758,15 @@ private:
 			ekf_.varMuScale()
 		}};
 		state.beta_rad = ekf_.beta();
+		state.debug_j_mu = debug_j_mu_;
+		state.debug_mu_scale_ref = debug_j_mu_enable_
+			? debug_mu_scale_ref_
+			: std::numeric_limits<float>::quiet_NaN();
+		state.debug_tire_forces = debug_tire_forces_;
+		state.debug_gamma = debug_gamma_;
+		state.i_mu = ekf_.muInformation();
+		state.i_mu_filt = ekf_.muInformationFiltered();
+		state.c_mu = ekf_.muConfidence();
 		state_publisher_->publish(state);
 
 		nav_msgs::msg::Odometry odometry;
@@ -603,6 +796,12 @@ private:
 		std_msgs::msg::Float32 beta;
 		beta.data = ekf_.beta();
 		beta_publisher_->publish(beta);
+
+		if (debug_j_mu_enable_) {
+			std_msgs::msg::Float32 debug_mu_sensitivity;
+			debug_mu_sensitivity.data = debug_j_mu_;
+			debug_mu_sensitivity_publisher_->publish(debug_mu_sensitivity);
+		}
 	}
 
 	void resetCallback(
@@ -636,18 +835,33 @@ private:
 	bool last_gyro_accepted_{false};
 	bool last_wheel_speed_accepted_{false};
 	bool last_accel_accepted_{false};
+	bool debug_j_mu_enable_{false};
+	float debug_mu_scale_ref_{1.0F};
+	float debug_j_mu_{std::numeric_limits<float>::quiet_NaN()};
+	bool debug_tire_util_enable_{false};
+	double debug_tire_util_min_speed_{2.0};
+	std::array<float, XAL_TIRE_N_FORCES> debug_tire_forces_{{
+		std::numeric_limits<float>::quiet_NaN(), std::numeric_limits<float>::quiet_NaN(),
+		std::numeric_limits<float>::quiet_NaN(), std::numeric_limits<float>::quiet_NaN(),
+		std::numeric_limits<float>::quiet_NaN(), std::numeric_limits<float>::quiet_NaN()
+	}};
+	std::array<float, XAL_TIRE_N_GAMMA> debug_gamma_{{
+		std::numeric_limits<float>::quiet_NaN(), std::numeric_limits<float>::quiet_NaN()
+	}};
 	std::string odom_frame_;
 	std::string base_frame_;
 	std::string vehicle_state_topic_;
 	std::string state_topic_;
 	std::string odometry_output_topic_;
 	std::string beta_topic_;
+	std::string debug_mu_sensitivity_topic_;
 
 	std::chrono::steady_clock::time_point last_loop_time_{std::chrono::steady_clock::now()};
 
 	rclcpp::Publisher<msg::BetaEkfState>::SharedPtr state_publisher_;
 	rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr odometry_publisher_;
 	rclcpp::Publisher<std_msgs::msg::Float32>::SharedPtr beta_publisher_;
+	rclcpp::Publisher<std_msgs::msg::Float32>::SharedPtr debug_mu_sensitivity_publisher_;
 	rclcpp::Subscription<bng_msgs::msg::BngVehicleStateMsg>::SharedPtr vehicle_state_subscription_;
 	rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr reset_service_;
 	rclcpp::TimerBase::SharedPtr estimator_timer_;
