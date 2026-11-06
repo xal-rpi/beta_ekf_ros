@@ -203,6 +203,50 @@ ros2 param set /beta_ekf tuning.mu_obs_enable true
 ros2 service call /casadi_ekf/reset std_srvs/srv/Trigger
 ```
 
+### Model-validity domain (`tuning.mu_domain_*`)
+
+`I_mu` measures how strongly friction affects the model, not whether the model
+is right. Friction matters most when tires slide (spins, lock-ups, hard braking
+in a turn), and that is exactly where the vehicle model is wrong. Without a
+validity check these maneuvers dominate the `mu_scale` update.
+
+The domain check sets a weight `w_domain` that multiplies `c_mu` (the gain
+only; the P_mu floor keeps using the information-based confidence, so frozen
+periods do not inflate P_mu). `w_domain = 0` while any of these holds, and for
+`mu_domain_hold_s` afterwards:
+
+- either axle's tire utilization `gamma_domain` > `mu_domain_gamma_max`.
+  γ is evaluated at a cautious `mu_scale − 2·√P_mu`, so an over-estimated
+  `mu_scale` cannot hide saturation;
+- the front wheels lock: measured front slip `kappa_front` <
+  `−mu_domain_kappa_lock` (the model has no front wheel-speed state);
+- the vehicle is not moving forward (`vx ≤ 0.5 m/s`).
+
+γ is normalized by friction (γ = 0.8 means 80 % of the available grip on any
+surface), so these limits are not specific to asphalt.
+
+| Parameter | Default | Meaning |
+|---|---|---|
+| `tuning.mu_domain_enable` | false | Turns the domain check on |
+| `tuning.mu_domain_gamma_max` | 0.85 | Upper tire-utilization limit |
+| `tuning.mu_domain_kappa_lock` | 0.3 | Front-lock slip threshold |
+| `tuning.mu_domain_hold_s` | 0.5 s | Hold time after leaving the domain |
+
+The defaults come from validation run 089 (techground asphalt, `mu_scale` held
+at 1.0). Up to γ ≈ 0.8 the model fits well (normalized fit error 0.3, best-fit
+`mu_scale` 1.10 [1.05–1.15]). At saturation (γ ≈ 1) the fit error is about
+6× larger and the best-fit `mu_scale` is wrong (0.75). After saturation the fit
+recovers within 0.3 s. Below γ ≈ 0.6 friction has no measurable effect on the
+model, so `I_mu` is low there anyway.
+
+```sh
+ros2 param set /beta_ekf tuning.mu_domain_enable true
+```
+
+The scripted validation sequence that produced these numbers is in
+`python_src/beamng_open_loop_control.ipynb` (last cell). The full analysis,
+with figures, is in [docs/mu_domain_validation.md](docs/mu_domain_validation.md).
+
 ## Debug features
 
 Both diagnostics are off by default, because each adds one extra CasADi model
@@ -263,6 +307,7 @@ ros2 topic echo /casadi_ekf/state --field debug_gamma
 |---|---|
 | `state[9]`, `variance[9]` | `mu_scale` and its variance P_mu |
 | `i_mu`, `i_mu_filt` | Raw and filtered friction information |
-| `c_mu` | Confidence used to scale the `mu_scale` gain (when enabled) |
+| `c_mu` | Confidence used to scale the `mu_scale` gain (when enabled); includes `w_domain` |
+| `w_domain`, `gamma_domain`, `kappa_front` | Model-validity weight and the cautious tire utilization / front slip it is based on |
 | `debug_j_mu`, `debug_mu_scale_ref` | Debug Jacobian sensitivity (NaN when off) |
 | `debug_tire_forces`, `debug_gamma` | Debug tire forces and utilization (NaN when off) |

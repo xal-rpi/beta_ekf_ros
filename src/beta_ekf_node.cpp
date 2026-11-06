@@ -159,6 +159,14 @@ private:
 		// Below this planar speed [m/s] gamma is published as NaN (slip ill-defined).
 		debug_tire_util_min_speed_ = declare_parameter("debug_tire_util_min_speed", 2.0);
 
+		// Model-validity domain for the mu_scale update (see updateMuDomain()).
+		// Defaults from validation run 089: the model fits well up to gamma 0.8
+		// and fails at saturation; the fit recovers < 0.3 s after gamma drops.
+		mu_domain_enable_ = declare_parameter("tuning.mu_domain_enable", false);
+		declare_parameter("tuning.mu_domain_gamma_max", 0.85);
+		declare_parameter("tuning.mu_domain_kappa_lock", 0.3);
+		declare_parameter("tuning.mu_domain_hold_s", 0.5);
+
 		BetaEKFTuning tuning{};
 		tuning.q_pos_e = tuningParameter("tuning.q_pos_e", tuning.q_pos_e);
 		tuning.q_pos_n = tuningParameter("tuning.q_pos_n", tuning.q_pos_n);
@@ -369,6 +377,21 @@ private:
 			wheel_speed_measurement_.valid = true;
 			wheel_speed_measurement_.updated = true;
 		}
+
+		// Front wheel speed is not fused; it is only used to detect front lock
+		// for the mu_scale validity domain.
+		const bool fl_ok = finite(message->w_fl);
+		const bool fr_ok = finite(message->w_fr);
+
+		if (fl_ok && fr_ok) {
+			front_wheel_speed_mps_ = static_cast<float>(0.5 * (message->w_fl + message->w_fr));
+		} else if (fl_ok) {
+			front_wheel_speed_mps_ = static_cast<float>(message->w_fl);
+		} else if (fr_ok) {
+			front_wheel_speed_mps_ = static_cast<float>(message->w_fr);
+		}
+
+		front_wheel_speed_valid_ = fl_ok || fr_ok;
 
 		process_inputs_.roadwheel_angle_rad = static_cast<float>(0.5 * (message->delta_l + message->delta_r));
 		process_inputs_.brake = static_cast<float>(message->brake);
@@ -590,7 +613,8 @@ private:
 		wheel_speed_measurement_.updated = false;
 		accel_measurement_.updated = false;
 
-		// Friction information for this cycle -> c_mu, and the P_mu floor.
+		// Model-validity weight, then friction information -> c_mu and the P_mu floor.
+		updateMuDomain(loop_time);
 		ekf_.finalizeMuCycle();
 
 		if (!ekf_.checkHealth()) {
@@ -631,9 +655,33 @@ private:
 	// -------------------------------------------------------------------------
 	void computeDebugTireUtilization()
 	{
+		std::array<float, XAL_TIRE_N_FORCES> forces{};
+		std::array<float, XAL_TIRE_N_GAMMA> gamma{};
+
+		if (!evaluateTireModel(ekf_.muScale(), forces, gamma)) {
+			return;  // Leave the outputs NaN.
+		}
+
+		debug_tire_forces_ = forces;
+
+		const double speed = std::hypot(ekf_.vx(), ekf_.vy());
+
+		if (speed >= debug_tire_util_min_speed_) {
+			debug_gamma_ = gamma;
+		}
+	}
+
+	// Evaluates xal_tire_forces on local copies at the current EKF state and
+	// inputs, with mu_scale replaced by the given value. Returns false if the
+	// CasADi call fails or any output is non-finite.
+	bool evaluateTireModel(
+		float mu_scale,
+		std::array<float, XAL_TIRE_N_FORCES> &forces,
+		std::array<float, XAL_TIRE_N_GAMMA> &gamma) const
+	{
 		casadi_real x_in[BetaEKF::NX] {
 			ekf_.posE(), ekf_.posN(), ekf_.psi(), ekf_.vx(), ekf_.vy(), ekf_.yawRate(),
-			ekf_.rearWheelSpeed(), ekf_.deltaFxHat(), ekf_.deltaFyHat(), ekf_.muScale()
+			ekf_.rearWheelSpeed(), ekf_.deltaFxHat(), ekf_.deltaFyHat(), mu_scale
 		};
 		casadi_real u_in[XAL_EKF_NU] {
 			process_inputs_.rear_wheel_torque_nm,
@@ -655,20 +703,85 @@ private:
 		res[1] = gamma_raw;
 
 		if (xal_tire_forces(arg, res, iw, w, 0) != 0) {
-			return;  // Leave the outputs NaN.
+			return false;
 		}
 
 		for (int i = 0; i < XAL_TIRE_N_FORCES; ++i) {
-			debug_tire_forces_[i] = static_cast<float>(forces_raw[i]);
-		}
-
-		const double speed = std::hypot(ekf_.vx(), ekf_.vy());
-
-		if (speed >= debug_tire_util_min_speed_) {
-			for (int i = 0; i < XAL_TIRE_N_GAMMA; ++i) {
-				debug_gamma_[i] = static_cast<float>(gamma_raw[i]);
+			forces[i] = static_cast<float>(forces_raw[i]);
+			if (!std::isfinite(forces[i])) {
+				return false;
 			}
 		}
+
+		for (int i = 0; i < XAL_TIRE_N_GAMMA; ++i) {
+			gamma[i] = static_cast<float>(gamma_raw[i]);
+			if (!std::isfinite(gamma[i])) {
+				return false;
+			}
+		}
+
+		return true;
+	}
+
+	// -------------------------------------------------------------------------
+	// MODEL-VALIDITY DOMAIN for the mu_scale update
+	//
+	// The vehicle model is only trusted below the friction limit. The domain is
+	// left (weight 0, held for mu_domain_hold_s afterwards) when:
+	//   - either axle's tire utilization exceeds mu_domain_gamma_max, with
+	//     gamma evaluated at a cautious mu_scale - 2*sqrt(P_mu) so that an
+	//     over-estimated mu_scale cannot hide saturation;
+	//   - the front wheels lock (measured slip ratio < -mu_domain_kappa_lock),
+	//     which the model cannot represent (no front wheel-speed state);
+	//   - the vehicle is not moving forward (vx <= 0.5 m/s).
+	// gamma is normalized by friction, so the limits carry over between surfaces.
+	// -------------------------------------------------------------------------
+	void updateMuDomain(std::chrono::steady_clock::time_point now)
+	{
+		mu_domain_enable_ = get_parameter("tuning.mu_domain_enable").as_bool();
+		const double gamma_max = get_parameter("tuning.mu_domain_gamma_max").as_double();
+		const double kappa_lock = get_parameter("tuning.mu_domain_kappa_lock").as_double();
+		const double hold_s = get_parameter("tuning.mu_domain_hold_s").as_double();
+
+		mu_domain_gamma_ = std::numeric_limits<float>::quiet_NaN();
+		mu_domain_kappa_front_ = std::numeric_limits<float>::quiet_NaN();
+
+		if (!mu_domain_enable_) {
+			mu_domain_weight_ = 1.0F;
+			ekf_.setMuDomainWeight(mu_domain_weight_);
+			return;
+		}
+
+		const float vx = ekf_.vx();
+		const float sigma_mu = std::sqrt(std::max(ekf_.varMuScale(), 0.0F));
+		const float mu_cautious = std::max(ekf_.muScale() - 2.0F * sigma_mu, 0.05F);
+
+		std::array<float, XAL_TIRE_N_FORCES> forces{};
+		std::array<float, XAL_TIRE_N_GAMMA> gamma{};
+		const bool tire_ok = evaluateTireModel(mu_cautious, forces, gamma);
+
+		if (tire_ok) {
+			mu_domain_gamma_ = std::max(gamma[0], gamma[1]);
+		}
+
+		if (front_wheel_speed_valid_ && std::fabs(vx) > 3.0F) {
+			mu_domain_kappa_front_ = (front_wheel_speed_mps_ - vx) / std::fabs(vx);
+		}
+
+		const bool invalid =
+			!tire_ok ||
+			mu_domain_gamma_ > gamma_max ||
+			(std::isfinite(mu_domain_kappa_front_) && mu_domain_kappa_front_ < -kappa_lock) ||
+			vx <= 0.5F;
+
+		if (invalid) {
+			mu_domain_last_invalid_ = now;
+		}
+
+		const double since_invalid =
+			std::chrono::duration<double>(now - mu_domain_last_invalid_).count();
+		mu_domain_weight_ = since_invalid < hold_s ? 0.0F : 1.0F;
+		ekf_.setMuDomainWeight(mu_domain_weight_);
 	}
 
 	// -------------------------------------------------------------------------
@@ -764,6 +877,9 @@ private:
 			: std::numeric_limits<float>::quiet_NaN();
 		state.debug_tire_forces = debug_tire_forces_;
 		state.debug_gamma = debug_gamma_;
+		state.w_domain = mu_domain_weight_;
+		state.gamma_domain = mu_domain_gamma_;
+		state.kappa_front = mu_domain_kappa_front_;
 		state.i_mu = ekf_.muInformation();
 		state.i_mu_filt = ekf_.muInformationFiltered();
 		state.c_mu = ekf_.muConfidence();
@@ -840,6 +956,13 @@ private:
 	float debug_j_mu_{std::numeric_limits<float>::quiet_NaN()};
 	bool debug_tire_util_enable_{false};
 	double debug_tire_util_min_speed_{2.0};
+	bool mu_domain_enable_{false};
+	float mu_domain_weight_{1.0F};
+	float mu_domain_gamma_{std::numeric_limits<float>::quiet_NaN()};
+	float mu_domain_kappa_front_{std::numeric_limits<float>::quiet_NaN()};
+	std::chrono::steady_clock::time_point mu_domain_last_invalid_{};
+	float front_wheel_speed_mps_{0.0F};
+	bool front_wheel_speed_valid_{false};
 	std::array<float, XAL_TIRE_N_FORCES> debug_tire_forces_{{
 		std::numeric_limits<float>::quiet_NaN(), std::numeric_limits<float>::quiet_NaN(),
 		std::numeric_limits<float>::quiet_NaN(), std::numeric_limits<float>::quiet_NaN(),

@@ -37,6 +37,16 @@ float32 i_mu
 float32 i_mu_filt
 float32 c_mu
 
+# Model-validity domain for the mu_scale update (tuning.mu_domain_enable).
+# c_mu above already includes w_domain. w_domain = 0 while either axle's tire
+# utilization gamma_domain (evaluated at mu_scale - 2*sqrt(P_mu)) exceeds
+# tuning.mu_domain_gamma_max, the front wheels lock (kappa_front <
+# -tuning.mu_domain_kappa_lock), or vx <= 0.5 m/s, and for tuning.mu_domain_hold_s
+# afterwards. w_domain is 1 and the other two NaN when the domain check is off.
+float32 w_domain
+float32 gamma_domain
+float32 kappa_front
+
 bool gps_velocity_accepted
 bool gyro_accepted
 bool wheel_speed_accepted
