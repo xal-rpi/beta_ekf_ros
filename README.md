@@ -63,7 +63,8 @@ ros2 param set /beta_ekf measurement_fuse_ratio 0.5
 Changing `loop_rate_hz` or a topic-name parameter requires restarting the node.
 
 GPS velocity, gyro, and wheel-speed fusion can also be enabled independently
-with `fuse_gps_velocity`, `fuse_gyro`, and `fuse_wheel_speed`.
+with `fuse_gps_velocity`, `fuse_gyro`, and `fuse_wheel_speed`. These are re-read
+every loop, so they can be switched with `ros2 param set` while the node runs.
 
 ## Changing topics or message types
 
@@ -141,13 +142,26 @@ switched with the `fuse_*` parameters.
 
 ### Observability-aware `mu_scale` update
 
-`mu_scale` is the tire-road friction scale. It multiplies the lateral friction
-(`fiala_mu`) of the exported model only; the longitudinal friction
-(`fiala_mu_x`) is frozen at its checkpoint value. (Scaling both was tried, but
-hard braking then biased `mu_scale` to about 1.4 on asphalt, because the model
-under-predicts the front brake force when the front wheels lock.) Friction is
-only observable when the tires work hard, so the `mu_scale` correction is
-weighted by how much friction information the measurements carry.
+`mu_scale` is the tire-road friction scale. It multiplies both the lateral
+(`fiala_mu`) and the longitudinal (`fiala_mu_x`) friction of the exported model,
+so one state represents the whole friction ellipse. This is selected at export
+time with `SCALE_LONGITUDINAL_FRICTION` in `process_model_and_jacobians_export.ipynb`
+and recorded as `XAL_MU_SCALE_LONGITUDINAL` in `generated/xal_ekf_dimensions.h`
+(and `mu_scale_targets` in the metadata). Friction is only observable when the
+tires work hard, so the `mu_scale` correction is weighted by how much friction
+information the measurements carry.
+
+> **History / caution:** scaling both directions was tried before the
+> model-validity domain existed. Hard braking and full-throttle launches then
+> biased `mu_scale` to about 1.4 on asphalt (front brake force under-predicted
+> when the front wheels lock; torque estimate at `torque_max`; rear tire
+> saturating early). Those phases are now blocked by the validity domain (γ >
+> `mu_domain_gamma_max` or front lock), so enable `tuning.mu_domain_enable`
+> together with `tuning.mu_obs_enable`. Whether the longitudinal information
+> *inside* the domain points to the right friction has **not yet been
+> validated**. A launch-specific failure (torque input too high → saturated
+> rear tire → `mu_scale` pulled down) and its fixes are analysed in
+> [docs/mu_x_launch_issue.md](docs/mu_x_launch_issue.md).
 Once per loop:
 
 1. The friction sensitivity `ξ = ∂x/∂mu_scale` is propagated with the model
@@ -171,6 +185,8 @@ Once per loop:
 | `tuning.mu_confidence_sigmoid_a` | 10.0 | Sharpness of the transition. Must be > 0. With a = 10, c_mu goes from 0.007 to 0.993; with a = 4, from 0.12 to 0.88. |
 | `tuning.mu_obs_p_high` | 0.25 | P_mu floor at c_mu = 0 |
 | `tuning.mu_obs_p_low` | 1e-3 | P_mu floor at c_mu = 1 |
+| `tuning.mu_initial_value` | 1.0 | `mu_scale` at every (re)initialization, applied at the next reset. Together with a frozen confidence (see the fixed-friction replays) it holds a chosen friction. |
+| `tuning.mu_initial_variance` | 0.25 | P_mu at every (re)initialization, applied at the next reset. 0.25 (σ = 0.5) lets the first informative maneuver move `mu_scale` a lot; a value near the settled P_mu (e.g. 0.002) avoids that. |
 
 Invalid values are clamped (`I_mu_high` to `I_mu_low + 1e-9`, `a` to `1e-3`),
 and the node prints a throttled warning.
@@ -190,10 +206,12 @@ Recommended procedure:
 5. Enable `tuning.mu_obs_enable`, reset the filter, and compare `mu_scale` with
    the disabled run.
 
-Because `mu_scale` scales lateral friction only, `I_mu` comes mainly from
-cornering. Pure acceleration or rear-wheel slip carries no friction
-information; hard braking does only when the front axle reaches its friction
-circle.
+Because `mu_scale` also scales longitudinal friction, rear wheel slip during
+acceleration and braking carries friction information as well as cornering
+(the front axle contributes under braking only when it reaches its friction
+circle, since its brake law uses `mu_y`). Re-check `I_mu_low` / `I_mu_high`
+whenever the export switch changes; the lateral-only levels measured in
+run 089 (`i_mu_filt` ≈ 0.03 in the valid window) are a lower bound.
 
 ```sh
 ros2 param set /beta_ekf tuning.I_mu_low 0.0

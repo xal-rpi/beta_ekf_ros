@@ -21,7 +21,8 @@ float32 debug_mu_scale_ref
 # inputs, from xal_tire_forces. NaN when debug_tire_util_enable is false.
 # debug_tire_forces: [Fx_f, Fy_f, Fz_f, Fx_r, Fy_r, Fz_r], tire/wheel frame [N]
 # debug_gamma: [front, rear] utilization of each axle's friction limit
-#   (mu_y includes mu_scale; mu_x is frozen at the checkpoint value):
+#   (mu_y includes mu_scale, and so does mu_x when the model was exported with
+#   SCALE_LONGITUDINAL_FRICTION, see XAL_MU_SCALE_LONGITUDINAL):
 #   front (friction circle): gamma_f = sqrt(Fx_f^2 + Fy_f^2) / (mu_y_f Fz_f)
 #   rear  (Fiala ellipse):   gamma_r = sqrt((Fx_r/(mu_x_r Fz_r))^2 + (Fy_r/(mu_y_r Fz_r))^2)
 #   also NaN below debug_tire_util_min_speed, where slip is ill-defined.
@@ -36,6 +37,13 @@ float32[2] debug_gamma
 float32 i_mu
 float32 i_mu_filt
 float32 c_mu
+
+# Debug: i_mu of the same cycle split by measurement channel (sums to i_mu):
+# [gps_vx, gps_vy, gyro, accel_x, accel_y, rear_wheel_speed, beta]
+float32[7] debug_i_mu_by_channel
+# Debug: friction sensitivity xi = d(state)/d(mu_scale), same order as state[]
+# (xi[9] = 1). s = H xi is what each measurement sees of a mu_scale change.
+float32[10] debug_xi
 
 # Model-validity domain for the mu_scale update (tuning.mu_domain_enable).
 # c_mu above already includes w_domain. w_domain = 0 while either axle's tire

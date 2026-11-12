@@ -195,6 +195,14 @@ private:
 		tuning.mu_obs_p_high = tuningParameter("tuning.mu_obs_p_high", tuning.mu_obs_p_high);
 		tuning.mu_obs_p_low = tuningParameter("tuning.mu_obs_p_low", tuning.mu_obs_p_low);
 		ekf_.setTuning(tuning);
+
+		// Initial mu_scale variance used on every (re)initialization. The old
+		// hard-coded 0.25 (sigma 0.5) lets the first informative maneuver move
+		// mu_scale by a large amount.
+		declare_parameter("tuning.mu_initial_variance", 0.25);
+		// Initial mu_scale on every (re)initialization (e.g. to hold a fixed
+		// friction for replays).
+		declare_parameter("tuning.mu_initial_value", 1.0);
 	}
 
 	float tuningParameter(const std::string &name, float default_value)
@@ -249,6 +257,11 @@ private:
 		tuning.mu_obs_p_high = static_cast<float>(get_parameter("tuning.mu_obs_p_high").as_double());
 		tuning.mu_obs_p_low = static_cast<float>(get_parameter("tuning.mu_obs_p_low").as_double());
 		ekf_.setTuning(tuning);
+
+		// Fusion switches can be changed at runtime with `ros2 param set`.
+		fuse_gps_velocity_ = get_parameter("fuse_gps_velocity").as_bool();
+		fuse_gyro_ = get_parameter("fuse_gyro").as_bool();
+		fuse_wheel_speed_ = get_parameter("fuse_wheel_speed").as_bool();
 	}
 
 	void createRosInterfaces()
@@ -442,10 +455,12 @@ private:
 			std::max(gps_measurement_.body_vx, 0.1F),
 			0.0F,
 			0.0F,
-			1.0F
+			static_cast<float>(std::max(get_parameter("tuning.mu_initial_value").as_double(), 0.01))
 		};
+		const float mu_initial_variance = static_cast<float>(
+			std::max(get_parameter("tuning.mu_initial_variance").as_double(), 1e-9));
 		float initial_variance[BetaEKF::NX] {
-			25.0F, 25.0F, 1.0F, 0.10F, 0.10F, 0.25F, 1.0F, 4.0F, 4.0F, 0.25F
+			25.0F, 25.0F, 1.0F, 0.10F, 0.10F, 0.25F, 1.0F, 4.0F, 4.0F, mu_initial_variance
 		};
 
 		ekf_.init(initial_state, initial_variance);
@@ -883,6 +898,12 @@ private:
 		state.i_mu = ekf_.muInformation();
 		state.i_mu_filt = ekf_.muInformationFiltered();
 		state.c_mu = ekf_.muConfidence();
+		for (int channel = 0; channel < BetaEKF::MU_CH_COUNT; ++channel) {
+			state.debug_i_mu_by_channel[channel] = ekf_.muInformationByChannel()[channel];
+		}
+		for (int i = 0; i < BetaEKF::NX; ++i) {
+			state.debug_xi[i] = ekf_.muSensitivityVector()[i];
+		}
 		state_publisher_->publish(state);
 
 		nav_msgs::msg::Odometry odometry;
